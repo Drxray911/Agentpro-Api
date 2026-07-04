@@ -1,0 +1,26 @@
+databases:
+  - name: agentpro-db
+    plan: free
+    databaseName: agentpro
+    user: agentpro_owner
+
+services:
+  - type: web
+    name: agentpro-api
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm run start:prod
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: agentpro-db
+          property: connectionString
+      - key: DATABASE_SSL
+        value: "true"
+      - key: JWT_SECRET
+        sync: false
+      - key: SEED_DEMO_DATA
+        value: "true"
+      - key: PORT
+        value: "10000"
