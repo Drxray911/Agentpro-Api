@@ -1,4 +1,4 @@
-import { IsString, Matches, IsNotEmpty, MinLength } from 'class-validator';
+import { IsString, Matches, IsNotEmpty } from 'class-validator';
 
 export class RegisterOwnerDto {
   @IsString()
