@@ -1,37 +1,56 @@
 import { ConflictException, Injectable } from '@nestjs/common';
-import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcrypt';
 import { DatabaseService } from '../database/database.service';
 import { RegisterOwnerDto } from './dto/register-owner.dto';
-import { JwtClaims } from './auth.service';
 
 @Injectable()
 export class RegistrationService {
-  constructor(
-    private db: DatabaseService,
-    private jwt: JwtService,
-  ) {}
+  constructor(private db: DatabaseService) {}
 
+  /**
+   * Registers a new Business Owner + their organization in
+   * 'pending_approval' status. Deliberately does NOT issue any JWT —
+   * the account cannot be used until a Superuser confirms the
+   * subscription payment and approves it (see AdminService.approveOrganization).
+   * This replaces the old flow, which created the org/user and signed
+   * tokens in the same request — that was fine for seeded demo
+   * accounts, but bypassed the payment-verification gate the product
+   * requires for real Business Owners.
+   */
   async registerOwner(dto: RegisterOwnerDto) {
-    const existing = await this.db.withoutRlsContext(async (client) => {
+    const existingPhone = await this.db.withoutRlsContext(async (client) => {
       const result = await client.query(`SELECT id FROM users WHERE phone = $1 AND deleted_at IS NULL`, [
         dto.phone,
       ]);
       return result.rows[0] ?? null;
     });
 
-    if (existing) {
+    if (existingPhone) {
       throw new ConflictException('An account with this phone number already exists. Try signing in instead.');
     }
 
-    const pinHash = await bcrypt.hash(dto.pin, 10);
+    const existingEmail = await this.db.withoutRlsContext(async (client) => {
+      const result = await client.query(
+        `SELECT id FROM users WHERE email = $1 AND deleted_at IS NULL`,
+        [dto.email.toLowerCase()],
+      );
+      return result.rows[0] ?? null;
+    });
+
+    if (existingEmail) {
+      throw new ConflictException('An account with this email already exists. Try signing in instead.');
+    }
+
+    const passwordHash = await bcrypt.hash(dto.password, 10);
 
     const created = await this.db.withoutRlsContext(async (client) => {
       await client.query('BEGIN');
       try {
         const orgResult = await client.query(
-          `INSERT INTO organizations (name) VALUES ($1) RETURNING id`,
-          [dto.businessName],
+          `INSERT INTO organizations (name, status, business_reg_number)
+           VALUES ($1, 'pending_approval', $2)
+           RETURNING id`,
+          [dto.businessName, dto.businessRegNumber ?? null],
         );
         const organizationId = orgResult.rows[0].id;
 
@@ -45,10 +64,10 @@ export class RegistrationService {
         const branchId = branchResult.rows[0].id;
 
         const userResult = await client.query(
-          `INSERT INTO users (organization_id, branch_id, full_name, phone, role, pin_hash)
-           VALUES ($1, $2, $3, $4, 'business_owner', $5)
+          `INSERT INTO users (organization_id, branch_id, full_name, phone, email, role, password_hash, is_active)
+           VALUES ($1, $2, $3, $4, $5, 'business_owner', $6, true)
            RETURNING id, full_name`,
-          [organizationId, branchId, dto.fullName, dto.phone, pinHash],
+          [organizationId, branchId, dto.fullName, dto.phone, dto.email.toLowerCase(), passwordHash],
         );
         const userId = userResult.rows[0].id;
 
@@ -57,10 +76,12 @@ export class RegistrationService {
           organizationId,
         ]);
 
-        await client.query(
-          `INSERT INTO user_devices (user_id, device_id, last_seen_at) VALUES ($1, $2, now())`,
-          [userId, dto.deviceId],
-        );
+        if (dto.deviceId) {
+          await client.query(
+            `INSERT INTO user_devices (user_id, device_id, last_seen_at) VALUES ($1, $2, now())`,
+            [userId, dto.deviceId],
+          );
+        }
 
         await client.query('COMMIT');
         return { userId, organizationId, branchId, fullName: userResult.rows[0].full_name };
@@ -70,27 +91,12 @@ export class RegistrationService {
       }
     });
 
-    const claims: JwtClaims = {
-      sub: created.userId,
-      organizationId: created.organizationId,
-      branchId: created.branchId,
-      role: 'business_owner',
-      fullName: created.fullName,
-    };
-
-    const accessToken = this.jwt.sign(claims, { expiresIn: '15m' });
-    const refreshToken = this.jwt.sign(claims, { expiresIn: '30d' });
-
     return {
-      accessToken,
-      refreshToken,
-      user: {
-        id: created.userId,
-        fullName: created.fullName,
-        role: 'business_owner',
-        branchId: created.branchId,
-        organizationId: created.organizationId,
-      },
+      status: 'pending_approval',
+      message:
+        'Your account has been created and is pending approval. Pay your subscription fee via MTN MoMo and submit the payment reference in-app; a Superuser will review and activate your account.',
+      organizationId: created.organizationId,
+      userId: created.userId,
     };
   }
 }

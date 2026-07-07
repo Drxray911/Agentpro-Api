@@ -4,6 +4,7 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 import { AuthController } from './auth.controller';
 import { AuthService } from './auth.service';
 import { RegistrationService } from './registration.service';
+import { PasswordResetService } from './password-reset.service';
 import { JwtAuthGuard } from './jwt-auth.guard';
 import { RolesGuard } from './roles.guard';
 
@@ -19,7 +20,7 @@ import { RolesGuard } from './roles.guard';
     }),
   ],
   controllers: [AuthController],
-  providers: [AuthService, RegistrationService, JwtAuthGuard, RolesGuard],
-  exports: [AuthService, RegistrationService, JwtAuthGuard, RolesGuard, JwtModule],
+  providers: [AuthService, RegistrationService, PasswordResetService, JwtAuthGuard, RolesGuard],
+  exports: [AuthService, RegistrationService, PasswordResetService, JwtAuthGuard, RolesGuard, JwtModule],
 })
 export class AuthModule {}
