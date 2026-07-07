@@ -45,7 +45,7 @@ export class DashboardService {
       };
 
       const recentResult = await client.query(
-        `SELECT t.id, t.transaction_type, n.code AS network_code, t.amount, t.commission,
+        `SELECT t.id, t.transaction_type, n.code AS network_code, t.amount, t.commission, t.provider_commission, t.net_commission,
                 t.status, t.created_at, c.full_name AS customer_name, c.phone AS customer_phone
          FROM transactions t
          JOIN networks n ON n.id = t.network_id
@@ -87,6 +87,13 @@ export function mapTransactionRow(row: any) {
     },
     amount: row.amount,
     commission: row.commission,
+    // Only present when the query selected these columns — undefined
+    // keys are dropped by JSON.stringify, so callers whose SELECT
+    // doesn't include provider_commission/net_commission (there are a
+    // couple of narrower queries elsewhere) get the same shape as
+    // before this migration, not a payload full of null noise.
+    providerCommission: row.provider_commission !== undefined ? row.provider_commission : undefined,
+    netCommission: row.net_commission !== undefined ? row.net_commission : undefined,
     status: row.status,
     createdAt: row.created_at,
   };

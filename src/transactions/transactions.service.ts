@@ -7,6 +7,7 @@ import { PoolClient } from 'pg';
 import { DatabaseService, RequestAuthContext } from '../database/database.service';
 import { CreateTransactionDto } from './dto/create-transaction.dto';
 import { mapTransactionRow } from '../dashboard/dashboard.service';
+import { computeCommission } from '../commissions/commission-calculator';
 
 // NestJS does not ship a built-in 402 exception class (only a curated
 // subset of HTTP statuses have dedicated classes), so this is a thin
@@ -38,7 +39,7 @@ export class TransactionsService {
       // duplicate or erroring. This is the same guarantee tested
       // directly against the database during schema development.
       const existing = await client.query(
-        `SELECT t.id, t.transaction_type, n.code AS network_code, t.amount, t.commission,
+        `SELECT t.id, t.transaction_type, n.code AS network_code, t.amount, t.commission, t.provider_commission, t.net_commission,
                 t.status, t.created_at, c.full_name AS customer_name, c.phone AS customer_phone
          FROM transactions t
          JOIN networks n ON n.id = t.network_id
@@ -53,21 +54,62 @@ export class TransactionsService {
       const networkId = NETWORK_IDS[dto.network];
       const amount = parseFloat(dto.amount);
 
-      const rateResult = await client.query(
-        `SELECT id, rate_percent FROM commission_rates
+      // Branch-specific custom rate first; if this branch has no
+      // active custom rate for this network/type, fall back to the
+      // Superuser-managed platform default. Only if neither exists is
+      // this genuinely unconfigured — that's the only case that should
+      // block the transaction outright.
+      let rateResult = await client.query(
+        `SELECT id, rate_percent, threshold_amount, cap_amount, provider_share_percent
+         FROM commission_rates
          WHERE branch_id = $1 AND network_id = $2 AND transaction_type = $3
            AND effective_to IS NULL`,
         [auth.branchId, networkId, dto.type],
       );
-      if (rateResult.rows.length === 0) {
-        throw new HttpException(
-          { errorCode: 'no_active_rate', message: `No active commission rate configured for ${dto.network}/${dto.type}` },
-          HttpStatus.UNPROCESSABLE_ENTITY,
+
+      let commissionRateId: string | null = null;
+      let ratePercent: number;
+      let thresholdAmount: number | null;
+      let capAmount: number | null;
+      let providerSharePercent: number;
+
+      if (rateResult.rows.length > 0) {
+        const row = rateResult.rows[0];
+        commissionRateId = row.id;
+        ratePercent = parseFloat(row.rate_percent);
+        thresholdAmount = row.threshold_amount !== null ? parseFloat(row.threshold_amount) : null;
+        capAmount = row.cap_amount !== null ? parseFloat(row.cap_amount) : null;
+        providerSharePercent = parseFloat(row.provider_share_percent);
+      } else {
+        const defaultResult = await client.query(
+          `SELECT rate_percent, threshold_amount, cap_amount, provider_share_percent
+           FROM platform_commission_defaults
+           WHERE network_id = $1 AND transaction_type = $2 AND effective_to IS NULL`,
+          [networkId, dto.type],
         );
+        if (defaultResult.rows.length === 0) {
+          throw new HttpException(
+            { errorCode: 'no_active_rate', message: `No active commission rate configured for ${dto.network}/${dto.type}` },
+            HttpStatus.UNPROCESSABLE_ENTITY,
+          );
+        }
+        const row = defaultResult.rows[0];
+        // commission_rate_id stays NULL when a platform default is what
+        // applied — there's no commission_rates row to point at, and
+        // forcing one would misrepresent this as a branch-specific rate.
+        ratePercent = parseFloat(row.rate_percent);
+        thresholdAmount = row.threshold_amount !== null ? parseFloat(row.threshold_amount) : null;
+        capAmount = row.cap_amount !== null ? parseFloat(row.cap_amount) : null;
+        providerSharePercent = parseFloat(row.provider_share_percent);
       }
-      const commissionRateId = rateResult.rows[0].id;
-      const ratePercent = parseFloat(rateResult.rows[0].rate_percent);
-      const commission = Math.round(amount * ratePercent * 100) / 100;
+
+      const { grossCommission, providerCommission, netCommission } = computeCommission({
+        amount,
+        ratePercent,
+        thresholdAmount,
+        capAmount,
+        providerSharePercent,
+      });
 
       // Float sufficiency check — only relevant for float-consuming
       // transaction types. This is the server-side enforcement of the
@@ -105,9 +147,9 @@ export class TransactionsService {
       const txResult = await client.query(
         `INSERT INTO transactions
            (branch_id, performed_by, customer_id, network_id, transaction_type,
-            amount, commission, commission_rate_id, external_reference,
+            amount, commission, provider_commission, net_commission, commission_rate_id, external_reference,
             status, client_generated_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'completed', $10)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'completed', $12)
          RETURNING id, created_at`,
         [
           auth.branchId,
@@ -116,7 +158,9 @@ export class TransactionsService {
           networkId,
           dto.type,
           amount,
-          commission,
+          grossCommission,
+          providerCommission,
+          netCommission,
           commissionRateId,
           dto.externalReference ?? null,
           dto.clientGeneratedId,
@@ -126,7 +170,13 @@ export class TransactionsService {
       const transactionId = txResult.rows[0].id;
       const createdAt = txResult.rows[0].created_at;
 
-      await this.applyLedgerEffects(client, auth, dto.type, dto.network, networkId, amount, commission, transactionId);
+      // Ledger effects use NET commission — that's the cash the
+      // business actually retains after the provider's cut, which is
+      // what cash-on-hand and the commission_earned entry should
+      // reflect. The gross figure stays on the transaction record
+      // itself for audit/reporting, but was never real spendable cash
+      // in full.
+      await this.applyLedgerEffects(client, auth, dto.type, dto.network, networkId, amount, netCommission, transactionId);
 
       return {
         transaction: {
@@ -135,7 +185,9 @@ export class TransactionsService {
           network: dto.network,
           customer: { fullName: dto.customerName ?? 'Walk-in Customer', phone: dto.customerPhone ?? null },
           amount: amount.toFixed(2),
-          commission: commission.toFixed(2),
+          commission: grossCommission.toFixed(2),
+          providerCommission: providerCommission.toFixed(2),
+          netCommission: netCommission.toFixed(2),
           status: 'completed',
           createdAt,
         },
@@ -215,7 +267,7 @@ export class TransactionsService {
 
       params.push(filters.pageSize, offset);
       const results = await client.query(
-        `SELECT t.id, t.transaction_type, n.code AS network_code, t.amount, t.commission,
+        `SELECT t.id, t.transaction_type, n.code AS network_code, t.amount, t.commission, t.provider_commission, t.net_commission,
                 t.status, t.created_at, c.full_name AS customer_name, c.phone AS customer_phone
          FROM transactions t
          JOIN networks n ON n.id = t.network_id
