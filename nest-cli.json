@@ -6,8 +6,8 @@
     "deleteOutDir": true,
     "assets": [
       {
-        "include": "sql/**/*",
-        "watchAssets": true
+        "include": "../sql/**/*",
+        "outDir": "dist/sql"
       }
     ]
   }
