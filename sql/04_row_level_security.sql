@@ -35,7 +35,18 @@ $$ LANGUAGE plpgsql STABLE;
 
 CREATE OR REPLACE FUNCTION app_current_org_id() RETURNS UUID AS $$
 BEGIN
-    RETURN current_setting('app.current_org_id', true)::UUID;
+    -- NULLIF guard is required, not optional: after a transaction-local
+    -- set_config(..., true) call reverts at COMMIT/ROLLBACK, Postgres
+    -- resets a custom (non-built-in) GUC like this one to an empty
+    -- string, not SQL NULL, when it had no prior value in the session.
+    -- On a pooled connection that's reused across requests, that means
+    -- any later query on this same connection that never sets its own
+    -- org_id (withoutRlsContext, withSuperAdminContext) would otherwise
+    -- crash trying to cast '' to UUID instead of correctly seeing "no
+    -- org context". Confirmed by direct testing — the naive version
+    -- without this guard fails intermittently the moment a pooled
+    -- connection is reused after any transaction that had set this.
+    RETURN NULLIF(current_setting('app.current_org_id', true), '')::UUID;
 END;
 $$ LANGUAGE plpgsql STABLE;
 
@@ -66,6 +77,15 @@ CREATE POLICY branches_modify ON branches
     FOR ALL
     USING (organization_id = app_current_org_id() AND app_is_org_wide_role())
     WITH CHECK (organization_id = app_current_org_id() AND app_is_org_wide_role());
+
+-- Needed by CommissionsService.resolveBranchIds() (and any future
+-- cross-org Superuser logic) running under
+-- DatabaseService.withSuperAdminContext(), which has no single
+-- organization_id to satisfy the org-scoped policy above.
+DROP POLICY IF EXISTS branches_super_admin_select ON branches;
+CREATE POLICY branches_super_admin_select ON branches
+    FOR SELECT
+    USING (current_setting('app.current_user_role', true) = 'super_admin');
 
 -- ---------------------------------------------------------------------
 -- users: org-wide roles see everyone in the org; others see only
@@ -110,6 +130,20 @@ DROP POLICY IF EXISTS users_login_lookup ON users;
 CREATE POLICY users_login_lookup ON users
     FOR SELECT
     USING (current_setting('app.current_user_role', true) IS NULL OR current_setting('app.current_user_role', true) = '');
+
+-- Distinct from users_login_lookup above: this is for an
+-- AUTHENTICATED Superuser session (app.current_user_role explicitly
+-- set to 'super_admin' via DatabaseService.withSuperAdminContext),
+-- needed so cross-org queries like AdminService's pending-organizations
+-- JOIN against users can actually see the owner's name/email/phone
+-- regardless of which organization they belong to. Kept as its own
+-- policy rather than folded into users_login_lookup's "no context"
+-- check, since those are different guarantees — "no context at all"
+-- and "an authenticated Superuser" should not share one mechanism.
+DROP POLICY IF EXISTS users_super_admin_select ON users;
+CREATE POLICY users_super_admin_select ON users
+    FOR SELECT
+    USING (current_setting('app.current_user_role', true) = 'super_admin');
 
 DROP POLICY IF EXISTS users_modify ON users;
 CREATE POLICY users_modify ON users

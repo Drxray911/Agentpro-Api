@@ -87,6 +87,42 @@ export class DatabaseService implements OnModuleDestroy {
   }
 
   /**
+   * For Superuser operations that must reach across every
+   * organization at once (approving registrations, verifying renewal
+   * payments, reviewing commission-rate requests, moderating Business
+   * Hub listings). Sets app.current_user_role to 'super_admin' and
+   * deliberately leaves org/branch unset — a Superuser isn't scoped to
+   * one organization, so there's no single org_id to set.
+   *
+   * This exists as its own method, distinct from withoutRlsContext,
+   * because "no context at all" and "an authenticated Superuser with
+   * no single org" are different things that happen to look similar —
+   * conflating them would mean any RLS policy written to allow "no
+   * context" (which a couple of tables need for pre-auth lookups, see
+   * users_login_lookup) accidentally also grants blanket Superuser-like
+   * access to anyone who simply never sets a context, which is not
+   * the same guarantee as "this request was authenticated and its JWT
+   * said super_admin". Every RLS policy a Superuser needs to bypass
+   * checks for this role explicitly (current_setting('app.current_user_role', true) = 'super_admin'),
+   * not "session vars are absent".
+   */
+  async withSuperAdminContext<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(`SELECT set_config('app.current_user_role', 'super_admin', true)`);
+      const result = await fn(client);
+      await client.query('COMMIT');
+      return result;
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
    * For auth endpoints (login) that run before any RLS context exists.
    * Deliberately does NOT set any session variables — queries run here
    * rely only on table-level grants, and should be limited to exactly
