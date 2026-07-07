@@ -41,6 +41,28 @@ function readSql(filename: string): string {
   return fs.readFileSync(path.join(SQL_DIR, filename), 'utf8');
 }
 
+// Every SQL file after 04_row_level_security.sql is a genuine
+// migration — it uses ALTER TABLE ADD COLUMN / CREATE TABLE, which
+// errors if re-run against a database that already has it, unlike
+// 01/02 (gated on "does the organizations table exist yet") or 04
+// (deliberately idempotent via DROP POLICY IF EXISTS + CREATE POLICY,
+// safe to re-run every boot). These need real once-only tracking
+// instead, via the schema_migrations table below.
+//
+// IMPORTANT: when adding a new numbered migration file, append its
+// filename to this array. Nothing scans the sql/ directory
+// automatically — that's deliberate, so a stray or half-written SQL
+// file sitting in sql/ can't get picked up and applied by accident.
+const TRACKED_MIGRATIONS = [
+  '05_registration_and_approval.sql',
+  '06_commission_engine.sql',
+  '07_platform_organization.sql',
+  '08_subscription_lifecycle.sql',
+  '09_fix_missing_force_rls.sql',
+  '10_business_hub.sql',
+  '11_ussd_templates.sql',
+];
+
 export async function bootstrapDatabase(connectionString: string): Promise<void> {
   const client = new Client({
     connectionString,
@@ -67,6 +89,35 @@ export async function bootstrapDatabase(connectionString: string): Promise<void>
 
     console.log('[bootstrap] Applying 04_row_level_security.sql...');
     await client.query(readSql('04_row_level_security.sql'));
+
+    // Tracked migrations (05+): each one applied at most once, ever,
+    // regardless of how many times the app restarts or redeploys.
+    await client.query(
+      `CREATE TABLE IF NOT EXISTS schema_migrations (
+         filename    TEXT PRIMARY KEY,
+         applied_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+       )`,
+    );
+
+    for (const filename of TRACKED_MIGRATIONS) {
+      const alreadyApplied = await client.query(`SELECT 1 FROM schema_migrations WHERE filename = $1`, [
+        filename,
+      ]);
+      if (alreadyApplied.rows.length > 0) {
+        console.log(`[bootstrap] Migration ${filename} already applied, skipping.`);
+        continue;
+      }
+      console.log(`[bootstrap] Applying migration ${filename}...`);
+      await client.query('BEGIN');
+      try {
+        await client.query(readSql(filename));
+        await client.query(`INSERT INTO schema_migrations (filename) VALUES ($1)`, [filename]);
+        await client.query('COMMIT');
+      } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+      }
+    }
 
     if (shouldSeed) {
       // Check if users already exist — seed whenever they don't,
